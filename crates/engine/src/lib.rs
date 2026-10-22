@@ -4837,11 +4837,17 @@ impl Session {
     /// per line in user space, URI). Text that already has a link over it is skipped.
     pub fn find_urls(&self, id: DocId) -> Vec<(usize, Vec<[f64; 4]>, String)> {
         let Some(doc) = self.get(id) else { return Vec::new() };
-        let config = RenderConfig { password: doc.password.as_deref().map(Arc::from), ..Default::default() };
+        let config =
+            RenderConfig { password: doc.password.as_deref().map(Arc::from), page_time_limit: doc.config.page_time_limit, ..Default::default() };
         let mut r = pdfcraft_render::PageRenderer::new(doc.bytes.clone(), config);
         let mut out = Vec::new();
         for page in 0..doc.info.pages.len() {
             let res = r.render(pdfcraft_render::RenderRequest { page, kind: pdfcraft_render::RequestKind::Text, scale: 1.0, ..Default::default() });
+            // Advisory, unlike `Session::compare`: this is a list the user picks from, so a page
+            // that could not be read contributes nothing rather than failing the search. With
+            // #3634 that includes a page that is merely very slow, so an empty answer can mean "one
+            // page was not searched". Compare reports instead, because its answer claims to be
+            // complete; this one does not.
             let Some(text) = res.text else { continue };
             let found: std::cell::RefCell<Vec<(std::ops::Range<usize>, String)>> = Default::default();
             let hits = text.find_with(|chars| {
