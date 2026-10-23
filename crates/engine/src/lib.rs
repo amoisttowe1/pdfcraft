@@ -512,6 +512,13 @@ fn undrawn_notices(prev: &pdfcraft_cos::Document, next: &pdfcraft_cos::Document)
 }
 
 impl Document {
+    /// The document's configured per-page render budget (#3634), exposed for window
+    /// paths that build their own render configuration and must honour it without reaching
+    /// into the private config field.
+    pub fn page_time_limit(&self) -> std::time::Duration {
+        self.config.page_time_limit
+    }
+
     /// How the document opens (Document Properties ▸ Initial View).
     /// Accessibility ▸ Check for accessibility: the full check (`None` if the document can't be
     /// read for editing).
@@ -998,6 +1005,7 @@ fn shown_under_redactions(
     overlays: &[pdfcraft_cos::ObjRef],
     pages: &[pdfcraft_render::PageInfo],
     password: Option<&str>,
+    page_time_limit: std::time::Duration,
 ) -> Result<(), EditError> {
     use pdfcraft_cos::Object;
     use pdfcraft_redact::RedactError;
@@ -1016,7 +1024,7 @@ fn shown_under_redactions(
         shown.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(kept))).map_err(|e| EditError::Write(e.to_string()))?;
     }
     let bytes = write_incremental(&shown, &SaveOptions::default()).map_err(|e| EditError::Write(e.to_string()))?;
-    let config = RenderConfig { password: password.map(Arc::from), ..Default::default() };
+    let config = RenderConfig { password: password.map(Arc::from), page_time_limit, ..Default::default() };
     let mut renderer = pdfcraft_render::PageRenderer::new(Arc::new(bytes), config);
     let mut residue = 0;
     for &pi in &marked {
@@ -3829,7 +3837,7 @@ impl Session {
                 if style.cover.is_none()
                     && let Some(info) = doc.info.pages.get(page)
                     && let Some(b) = editor.text_blocks(page).ok().and_then(|b| b.get(block).filter(|b| b.invisible).cloned())
-                    && let Some((paper, ink)) = guard(|| scan_colours::sample(&editor.cos, info, page, &b)).ok().flatten()
+                    && let Some((paper, ink)) = guard(|| scan_colours::sample(&editor.cos, info, page, &b, doc.config.page_time_limit)).ok().flatten()
                 {
                     style.cover = Some(paper);
                     style.color = style.color.or(Some(ink));
@@ -3856,8 +3864,10 @@ impl Session {
         if let Edit::ApplyRedactions { pages } = &edit {
             let marks: Vec<pdfcraft_redact::Mark> =
                 pdfcraft_redact::marks(&editor.cos).into_iter().filter(|m| pages.as_ref().is_none_or(|p| p.contains(&m.page))).collect();
-            guard(|| shown_under_redactions(&next, &marks, &cx.redaction_overlays, &doc.info.pages, doc.password.as_deref()))
-                .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+            guard(|| {
+                shown_under_redactions(&next, &marks, &cx.redaction_overlays, &doc.info.pages, doc.password.as_deref(), doc.config.page_time_limit)
+            })
+            .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
         }
         // Renamed fields are said, not slipped in: a repair-log note (with the caveat that
         // scripts were left alone) and a count in the undo step's label.
