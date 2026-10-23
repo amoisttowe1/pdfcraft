@@ -80,8 +80,9 @@ pub struct RenderConfig {
     /// for an unusual batch; at or above [`NO_PAGE_TIME_LIMIT`] there is no timer at all, so a page
     /// runs as long as it takes rather than being bounded by a day). Setting this does not slow the
     /// viewer down: its pools clamp to [`STUCK_AFTER`] however large the number is. Every engine path
-    /// that reads pages — export, OCR, print, compare, word count, URL and field detection — passes a
-    /// document's own value through, so one setting holds across a job; the viewer's pool honours it
+    /// that reads pages — export, OCR, print (label crops included), compare, word count, URL and
+    /// field detection, the redaction check-back and reading-colour samples — passes a document's
+    /// own value through, so one setting holds across a job; the viewer's pool honours it
     /// only downwards, and never gives up its [`STUCK_AFTER`] ceiling. Not enforced on wasm32, where there is no thread
     /// to raise the flag from — inline rendering is unbounded on that target either way.
     pub page_time_limit: std::time::Duration,
@@ -489,7 +490,7 @@ impl PageRenderer {
         let settings = budget.as_ref().map_or_else(|| self.settings.clone(), |g| g.applied_to(&self.settings));
         let r = catch_unwind(AssertUnwindSafe(|| crate::text::extract_page_filtered(pdf, page, &settings, filter)))
             .map_err(|e| format!("text extraction failed: {}", panic_message(&e)))?;
-        let over_time = budget.as_ref().filter(|g| g.expired()).map(|_| self.config.page_time_limit);
+        let over_time = budget.as_ref().filter(|g| g.cut_short()).map(|_| self.config.page_time_limit);
         drop(budget);
         match over_time {
             Some(limit) if r.is_ok() => Err(stuck_message(&RenderRequest { page, kind: RequestKind::Text, ..Default::default() }, limit)),
@@ -524,7 +525,7 @@ impl PageRenderer {
         let budget = PageTimeLimit::arm(self.config.page_time_limit);
         let settings = budget.as_ref().map_or_else(|| settings.clone(), |g| g.applied_to(&settings));
         let r = render_page(pdf, &cache, &settings, &self.config, req);
-        let over_time = budget.as_ref().filter(|g| g.expired()).map(|_| self.config.page_time_limit);
+        let over_time = budget.as_ref().filter(|g| g.cut_short()).map(|_| self.config.page_time_limit);
         drop(budget);
         let warnings = take_warnings(&warnings);
         let r = match over_time {
@@ -616,20 +617,31 @@ fn stuck_message(req: &RenderRequest, limit: std::time::Duration) -> String {
 /// thread instead of pooling (#3634). The timer ends when the guard is dropped, so a render that
 /// finishes in time leaves no thread behind.
 ///
-/// The verdict is the flag, and not the clock: a page that ran past its budget but still reached
-/// the end of its content has drawn everything it was going to draw, and discarding that over a
-/// stopwatch reading would lose the user real output for no benefit. A page whose flag was raised
-/// did stop between operators, so its drawing is incomplete by definition (see
-/// `InterpreterSettings::cancelled`) and the caller reports it skipped instead. This keeps the same
-/// trade the pool's watchdog makes — including its narrow edge: a page that finishes after its
-/// budget has elapsed but before the interpreter's next look at the flag is reported skipped, since
-/// nothing in hayro tells us whether the flag was ever seen (`interpret_page` returns `()`).
-/// Distinguishing "stopped at the flag" from "finished just after it" would need a vendor change;
-/// the window costs one late page on an already-slow document, so it is left as the pool leaves it.
+/// The verdict is not the flag alone. Nothing downstream of the interpreter consults the flag —
+/// rasterization in particular runs long after the last operator is picked up — so a page whose
+/// content finished inside its budget can still see the timer ring mid-paint, and throwing that
+/// drawing away over a late bell would lose complete output for no benefit. Instead the
+/// interpreter reports back when it stops on the flag with work still pending
+/// (`InterpreterSettings::cancel_heeded`), and only a witnessed stop reports the page skipped:
+/// output lost for real is named, late-but-complete pages keep their pixels. A zero budget needs
+/// no witness — it is the caller's own words that no operator may run, so its page is refused
+/// however quickly it finishes. Two margins are disclosed rather than papered over. At a content
+/// stream's final boundary `needs_more` is still true until EOF is actually read, so a page finishing
+/// exactly there can over-report as skipped even though nothing was dropped — the safe direction,
+/// since under-reporting is what would hand out a partial page. And the pool makes a different trade
+/// in the same spirit: its watchdog retries shared renders under fresh budgets and retires wedged
+/// workers without a verdict for them, while a caller waiting on an abandoned non-shared page still
+/// receives the watchdog's skipped report — abandonment there is recovery, not silence.
 #[cfg(not(target_arch = "wasm32"))]
 struct PageTimeLimit {
     /// Shared with the interpreter, which checks it before every content operator.
     cancelled: Arc<AtomicBool>,
+    /// Set by the interpreter (see `InterpreterSettings::cancel_heeded`) when it stopped on
+    /// `cancelled` with work still pending: the only proof that what got drawn is incomplete.
+    heeded: Arc<AtomicBool>,
+    /// Whether the budget was zero at arm time - the caller's own words that no operator may
+    /// run, which needs no witness to have taken effect.
+    zero: bool,
     /// Closing it (on drop) tells the timer thread the render is over. Kept unnamed so the
     /// guard's own drop is what releases the thread — which also means a guard must never be
     /// stored somewhere that outlives the render it bounds.
@@ -649,7 +661,9 @@ impl PageTimeLimit {
         if limit >= NO_PAGE_TIME_LIMIT {
             return None;
         }
-        let cancelled = Arc::new(AtomicBool::new(limit.is_zero()));
+        let zero = limit.is_zero();
+        let cancelled = Arc::new(AtomicBool::new(zero));
+        let heeded = Arc::new(AtomicBool::new(false));
         let (finished, waiting) = std::sync::mpsc::channel::<()>();
         if !limit.is_zero() {
             let flag = cancelled.clone();
@@ -664,18 +678,20 @@ impl PageTimeLimit {
                 return None;
             }
         }
-        Some(Self { cancelled, _finished: finished })
+        Some(Self { cancelled, heeded, zero, _finished: finished })
     }
 
-    /// Whether the timer got to stop this render. Only then is what it drew incomplete; a page that
-    /// ran long but finished intact keeps its output (see the note on the type).
-    fn expired(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+    /// Whether this render was verifiably cut short: the flag rang, and either the interpreter
+    /// stopped on it with work still pending or the budget was zero. A flag raised after the
+    /// content had run to its end - nothing downstream of the interpreter listens, least of all
+    /// rasterization - keeps its output (see the note on the type).
+    fn cut_short(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) && (self.zero || self.heeded.load(Ordering::Acquire))
     }
 
     /// `settings` with this guard's flag installed, so the interpreter stops when it expires.
     fn applied_to(&self, settings: &InterpreterSettings) -> InterpreterSettings {
-        InterpreterSettings { cancelled: Some(self.cancelled.clone()), ..settings.clone() }
+        InterpreterSettings { cancelled: Some(self.cancelled.clone()), cancel_heeded: Some(self.heeded.clone()), ..settings.clone() }
     }
 }
 
@@ -692,7 +708,7 @@ impl PageTimeLimit {
         None
     }
 
-    fn expired(&self) -> bool {
+    fn cut_short(&self) -> bool {
         false
     }
 

@@ -14,6 +14,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use crate::raster::PageTimeLimit;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -243,4 +244,26 @@ fn the_viewer_keeps_its_own_ceiling_whatever_the_document_asks_for() {
 
     // The generous default must not reach the window: a pool still gives up after twenty seconds.
     assert_eq!(super::pool_stuck_after(&RenderConfig::default()), STUCK_AFTER, "the default budget is for callers that wait, not for the viewer");
+}
+
+/// #3634 review round 2: a flag that rings after the content ran to its end is not proof of an
+/// early stop - rasterization never consults it, and a late bell over a finished page used to
+/// throw the drawing away. Only a witnessed stop (or a zero budget) cuts a page short, and the
+/// guard is where that distinction lives.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_flag_raised_after_completion_is_not_an_early_stop() {
+    let g = PageTimeLimit::arm(std::time::Duration::from_millis(40)).expect("arming with a real budget spawns the timer");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(g.cancelled.load(std::sync::atomic::Ordering::Relaxed), "the timer should have rung");
+    assert!(!g.cut_short(), "nothing ever obeyed the flag: a page nobody interrupted is not a stopped one");
+}
+
+/// A zero budget is the caller's own words that no operator may run; it cuts a page short
+/// without needing any interpreter to testify - which is why an empty page gets refused too.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_zero_budget_cuts_short_before_anything_runs() {
+    let g = PageTimeLimit::arm(std::time::Duration::ZERO).expect("a zero budget arms with the flag already raised");
+    assert!(g.cut_short(), "zero means no work, however quickly it would have finished");
 }
