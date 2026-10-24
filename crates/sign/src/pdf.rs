@@ -2261,9 +2261,12 @@ pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampA
     // that is neither absent nor array-like, would be replaced by the write below (base
     // never touched AcroForm). Such corrupt input keeps the standalone dictionary, which
     // scan discovery finds; an absent form is created (nothing to lose) and a dangling
-    // /AcroForm reference is filled in. An explicit null /AcroForm is different: the author
-    // set that entry, so it is conservative to fall through rather than overwrite their
-    // statement with our own dictionary.
+    // /AcroForm reference is filled in — except when that slot numbers one of the objects
+    // we just allocated: the form then lands inline in the catalog, never merged onto our
+    // stamp or widget, never replacing our cloned annotation array (see the collision
+    // check at the write). An explicit null /AcroForm is different: the author set that
+    // entry, so it is conservative to fall through rather than overwrite their statement
+    // with our own dictionary.
     let anchor = match (doc.root(), pdfcraft_annot::page_refs(&doc).ok().and_then(|p| p.first().copied())) {
         (Some(root), Some(page)) => {
             let fields_writable = |d: &Dict| match d.get(b"Fields") {
@@ -2306,16 +2309,25 @@ pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampA
         // Print + Locked, as `sign` marks its widgets.
         w.set(b"F".to_vec(), Object::Int(4 | 128));
         let wr = doc.add(Object::Dict(w));
-        // Page /Annots: indirect arrays are updated in place, as `sign` does. A reference to
-        // anything that is not an array is corrupt — leave that object untouched (the
-        // `annot::set_annots` precedent) and rewrite the page entry inline instead, so a
-        // never-read object is never replaced.
+        // A /Annots array cloned into a fresh object (below), if any: the form write must
+        // never retarget it (see the collision check there). Explicitly typed: a mutant
+        // deletes the only assignment, and the binding's type would then fail inference.
+        let mut nar: Option<ObjRef> = None;
+        // Page /Annots: a referenced array may be shared by several pages, so append through
+        // a fresh array of this page's own and leave the old object byte-untouched — no
+        // other page gains a widget it never asked for. (`sign` still updates in place;
+        // pre-existing since #621, untouched here.) A reference to anything that is not an
+        // array is corrupt — leave that object untouched (the `annot::set_annots`
+        // precedent) and rewrite the page entry inline, so a never-read object is never
+        // replaced.
         let pd = doc.get(page).as_dict().cloned().unwrap_or_default();
         match pd.get(b"Annots") {
             Some(Object::Ref(ar)) if doc.get(*ar).as_array().is_some() => {
                 let mut a = doc.get(*ar).as_array().cloned().unwrap_or_default();
                 a.push(Object::Ref(wr));
-                doc.set(*ar, Object::Array(a));
+                let nr = doc.add(Object::Array(a));
+                nar = Some(nr);
+                doc.update_dict(page, |d| d.set(b"Annots".to_vec(), Object::Ref(nr)))?;
             }
             other => {
                 let mut a = other.and_then(|o| o.as_array().cloned()).unwrap_or_default();
@@ -2325,11 +2337,23 @@ pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampA
         }
         // AcroForm /Fields and /SigFlags (signatures exist, append only).
         let catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
-        let (af_ref, mut af) = match catalog.get(b"AcroForm") {
+        let (af_ref, af) = match catalog.get(b"AcroForm") {
             Some(Object::Ref(r)) => (Some(*r), doc.get(*r).as_dict().cloned().unwrap_or_default()),
             Some(Object::Dict(d)) => (None, d.clone()),
             _ => (None, Dict::new()),
         };
+        // A dangling /AcroForm slot can number-collide with an object this function just
+        // allocated. The writable check above cannot stop it: at check time the slot for
+        // `sig` holds our own stamp dict (get() is overlay-first, so it passes as a form),
+        // and the slots for `wr` or a cloned /Annots array are still free — they pass as
+        // dangling and are legitimately filled... until the allocator hands out exactly
+        // those numbers before the write below lands. Never build the form ON sig, wr or
+        // the cloned array (that merges two kinds into one dictionary, or replaces the
+        // array); on a collision, start a clean inline form in the catalog instead.
+        // Numbers compare generation-blind, as get() does: /AcroForm 9 1 R still aliases
+        // our 9 0 R.
+        let collides = af_ref.is_some_and(|r| r.num == sig.num || r.num == wr.num || nar.is_some_and(|n| n.num == r.num));
+        let (af_ref, mut af) = if collides { (None, Dict::new()) } else { (af_ref, af) };
         let mut fields = match af.get(b"Fields") {
             Some(Object::Ref(r)) => doc.get(*r).as_array().cloned().unwrap_or_default(),
             Some(Object::Array(a)) => a.clone(),
