@@ -323,9 +323,9 @@ proptest! {
     /// behind — "no fill" is stored as absence, not as black.
     ///
     /// The range includes NEGATIVE widths on purpose: `add_annotation` screens width for
-    /// non-finiteness only (`crates/annot/src/lib.rs:1018` tests `style.width.is_finite()`; the
-    /// `abs() < 1e7` cap inside `finite()` at `:827-829` guards `color`, never width), so
-    /// negatives are accepted and then clamped by `max(0.0)` on the way to `/BS /W` (`:1030`).
+    /// non-finiteness only (`crates/annot/src/create.rs:416` tests `style.width.is_finite()`; the
+    /// `abs() < 1e7` cap inside `finite()` at `create.rs:17-19` guards `color`, never width), so
+    /// negatives are accepted and then clamped by `max(0.0)` on the way to `/BS /W` (`create.rs:216`).
     /// Sampling `0.0..` alone left both clamps untested while this test's name implied coverage.
     /// The upper end stays modest deliberately: magnitude is not screened here either, so a huge
     /// width would be written verbatim — that case is pinned in `malformed.rs`, not by this

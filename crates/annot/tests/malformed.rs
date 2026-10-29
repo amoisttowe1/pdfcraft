@@ -331,7 +331,7 @@ fn wrong_typed_flag_opacity_and_colour_entries_fall_back_without_panicking() {
 // ── guards that only bite on damaged data, pinned so they stay visible ────────────────────────
 
 /// `move_annotation` shifts the numbers of every geometry key, but only the first four of an array
-/// it treats as a rectangle (`every || i < 4`, `crates/annot/src/lib.rs:1718`). A `/Rect` with
+/// it treats as a rectangle (`every || i < 4`, `crates/annot/src/modify.rs:302`). A `/Rect` with
 /// more than four numbers is not something PdfCraft writes, so the guard only shows up on damaged
 /// data — which is precisely why it is pinned here: without this test the rule can be deleted
 /// silently. What must hold is that the four rectangle numbers move together and whatever strays
@@ -510,10 +510,11 @@ fn an_attachment_needs_a_name_and_leaves_nothing_behind_when_it_has_none() {
 
 /// This is a MAGNITUDE story, not a one-field story. `rect_for` checks the rectangle of every
 /// variant but passes `Shape::CustomStamp { size }` and `Shape::TypedSignature { contours }`
-/// straight into `/PCPictureSize` and `/PCOutline` (`lib.rs:872-892`, `:1104`, `:1111`) with no
+/// straight into `/PCPictureSize` and `/PCOutline` (`create.rs:62-82`, `create.rs:278`,
+/// `create.rs:285`) with no
 /// magnitude screen whatsoever — and width gets none either. The only style guard on the create
-/// path (`lib.rs:1018`) reads `!finite(&style.color) || !style.opacity.is_finite()
-/// || !style.width.is_finite()`: `finite()` (`:827-829`, i.e. `is_finite() && abs() < 1e7`)
+/// path (`create.rs:416`) reads `!finite(&style.color) || !style.opacity.is_finite()
+/// || !style.width.is_finite()`: `finite()` (`create.rs:17-19`, i.e. `is_finite() && abs() < 1e7`)
 /// magnitude-screens `color` ALONE, while `opacity` and `width` are checked for non-finiteness
 /// only. So even the one cap that exists sits at ten million, far below what a reader can turn
 /// into an integer. Measured with qpdf's check (`pikepdf.Job(["--check", <path>, "/dev/null"])`,
@@ -561,22 +562,23 @@ fn an_attachment_needs_a_name_and_leaves_nothing_behind_when_it_has_none() {
 ///
 /// How far a caller can actually get there, checked in this workspace rather than assumed: only
 /// `/BS /W` is reachable through a shipped path. The automation tools read `width` as any finite
-/// number (`crates/automation/src/comments.rs:402-403` assigns `style.width = w.max(0.0)` after
-/// `opt_num`, whose only filter is `is_finite()` at `crates/automation/src/lib.rs:2233-2235`),
+/// number (`crates/automation/src/comments.rs:427-429` assigns `style.width = w.max(0.0)` after
+/// `opt_num`, whose only filter is `is_finite()` at `crates/automation/src/json.rs:112-113`),
 /// and the published schema sets `"minimum": 0` with no upper bound
-/// (`crates/automation/src/tools.rs:655`) — so a script or MCP agent can write a file whose
+/// (`crates/automation/src/tools.rs:774`) — so a script or MCP agent can write a file whose
 /// annotation object qpdf refuses to parse. The desktop UI caps the same value at 0.5..=12.0
-/// (`crates/ui-egui/src/comment_props.rs:245`), and `/PCPictureSize` / `/PCOutline` are computed
-/// inside the engine — `crates/engine/src/lib.rs:2343` takes the source image's pixel size,
-/// scales it to a 200 pt natural box at `:2347-2351` and hands that size to the stamp shape at
-/// `:2353`, while contour sizing lives at `crates/engine/src/lib.rs:104-114` (which does reject a
+/// (`crates/ui-egui/src/dialogs/comment_props.rs:240-243`, `0.5..=12.0`, or a 0.0 floor when a
+/// font size is set), and `/PCPictureSize` / `/PCOutline` are computed
+/// inside the engine — `crates/engine/src/edit/run.rs:331` takes the source image's pixel size,
+/// scales it to a 200 pt natural box at `:335-339` and hands that size to the stamp shape at
+/// `:343`, while contour sizing lives at `crates/engine/src/fill_sign.rs:14-20` (which does reject a
 /// non-positive width) — so reaching those two needs a caller using the crates directly
 /// rather than an app or tool action. The defect is therefore automation-reachable today, and not
 /// reachable by clicking in the desktop app.
 ///
 /// Non-finite values are rewritten on the way out: `write_real` (`crates/cos/src/writer.rs:48`)
 /// emits a literal `0` for any non-finite REAL that reaches it, which is the mechanism for
-/// `size` and contour points. Colours are a different route — `rgb()` (`lib.rs:823-825`) clamps
+/// `size` and contour points. Colours are a different route — `rgb()` (`create.rs:13-15`) clamps
 /// each component to `0.0..=1.0` BEFORE the writer sees it, so infinity becomes `1.0`, not `0`
 /// (see the create-vs-edit case below). The assertions that follow pin only what we write.
 ///
@@ -631,12 +633,12 @@ fn unvalidated_stamp_size_and_signature_contours_are_rewritten_silently_in_the_f
 }
 
 /// The fill colour is screened differently on the two paths. `add_annotation` magnitude-screens
-/// only `style.color`, through `finite()` (`lib.rs:1018`; the helper at `:827-829` is
+/// only `style.color`, through `finite()` (`create.rs:416`; the helper at `create.rs:17-19` is
 /// `is_finite() && abs() < 1e7`), gives `opacity` and `width` plain finiteness checks, and never
-/// screens `fill` at all; `set_fill` refuses the same value (`lib.rs:2010`, "invalid fill
+/// screens `fill` at all; `set_fill` refuses the same value (`modify.rs:626-627`, "invalid fill
 /// colour") — and that refusal calls `finite()` too, which is why it trips on anything from ten
 /// million up as well as on NaN or infinity. The accepted value is then clamped component-wise by
-/// `rgb()` (`lib.rs:823-825`, `clamp(0.0, 1.0)`), so what lands in the file is the top of the
+/// `rgb()` (`create.rs:13-15`, `clamp(0.0, 1.0)`), so what lands in the file is the top of the
 /// range: NaN survives clamping as NaN and `write_real` (`crates/cos/src/writer.rs:48`) then
 /// emits a literal `0`, while infinity becomes `1.0`. Measured across magnitudes
 /// in `the_same_huge_fill_is_accepted_on_create_and_refused_on_edit`, which pins
@@ -782,9 +784,10 @@ proptest! {
 }
 
 /// Read side, measured: a negative border width arriving from another tool is reported unchanged
-/// by the public API. Our own writer clamps negatives to 0 (`lib.rs:857`, `:1030`), and the
-/// helper `border_width_of` (`lib.rs:1872-1874`) does apply `.max(0.0)` — but the property read
-/// path used here (`props()` -> `lib.rs:2237-2238`) takes `/BS /W` raw, so a foreign file
+/// by the public API. Our own writer clamps negatives to 0 (`create.rs:47`, `create.rs:216`), and
+/// the helper `border_width_of` (`modify.rs:498-500`) does apply `.max(0.0)` — but the property
+/// read path used here (`props()` -> `info.rs:227-231`) takes `/BS /W` raw for non-FreeText
+/// subtypes, so a foreign file
 /// declaring -3 comes back as -3.0. Pinned because the asymmetry is visible in the public API:
 /// what we refuse to keep, we are willing to report. (Compare `/CA`, likewise unclamped on read.)
 #[test]
@@ -799,13 +802,13 @@ fn foreign_negative_border_width_is_reported_as_written() {
     assert_eq!(
         p.width,
         Some(-3.0),
-        "props() reports /BS /W as written; note border_width_of (lib.rs:1872-1874) does clamp at zero, so this is path-specific"
+        "props() reports /BS /W as written; note border_width_of (modify.rs:498-500) does clamp at zero, so this is path-specific"
     );
     assert!(doc.repair_log().is_empty(), "and that neither is recorded as a repair");
 }
 
 /// The create-vs-edit divergence is wider than the NaN case: the edit-side refusal begins at `1e7`
-/// **in magnitude**, because `finite()` (`lib.rs:827-829`, called by the edit path at `:2010`)
+/// **in magnitude**, because `finite()` (`create.rs:17-19`, called by the edit path at `modify.rs:626`)
 /// tests `abs() < 1e7`, so a component of magnitude exactly ten million is refused (positive or
 /// negative) while 9,999,999 passes — what THIS test pins is the positive side (1e7, 1e8, infinity);
 /// a negative-magnitude row is not pinned here, only reasoned from `abs()` (independently measured
@@ -813,7 +816,7 @@ fn foreign_negative_border_width_is_reported_as_written() {
 /// while create never screens `fill` at all, so any value whatsoever is accepted
 /// there. Measured, not assumed — the
 /// expected `/IC` components below are what this crate's writer actually produced on re-run
-/// (clamping happens in `rgb()`, `lib.rs:823-825`, so an accepted huge component lands at 1.0).
+/// (clamping happens in `rgb()`, `create.rs:13-15`, so an accepted huge component lands at 1.0).
 #[test]
 fn the_same_huge_fill_is_accepted_on_create_and_refused_on_edit() {
     let cases: [([f64; 3], &[f64; 3]); 3] =

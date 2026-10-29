@@ -27,7 +27,7 @@ mod support {
 
 use pdfcraft_annot::{
     AnnotError, AttachIcon, LineEnding, Markup, Meta, NewAnnotation, NoteIcon, OverlayFont, OverlayLook, ReviewState, Shape, StampKind, Style,
-    add_annotation, add_reply, delete_annotation, links, page_refs, props, set_locked, set_review_state, set_style, summaries,
+    StyleChange, add_annotation, add_reply, delete_annotation, links, page_refs, props, set_locked, set_review_state, set_style, summaries,
 };
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions};
 
@@ -539,18 +539,20 @@ fn attached_file_specification_and_bytes_survive_every_save_path() {
 /// top edge first; both are checked, because `index` refers to `/Annots` position while the list
 /// order does not.
 /// COVERAGE HONESTY (ten single-site mutations, run independently by two reviewers plus the
-/// author). FIVE are also killed by pre-existing inline tests in `crates/annot/src/tests.rs`, and
+/// author; run at base 99941daa, before main split `lib.rs` into modules - the anchors below
+/// are the merged layout, re-derived line by line from the split files). FIVE are also killed by pre-existing inline tests in `crates/annot/src/tests.rs`, and
 /// they share a family — the clamp is INVERTED, or a key/order changed rather than removed:
-/// `lib.rs:857` inverted (`ink_strokes_are_smooth_curves_through_their_points`), `:1030` inverted
-/// (six inline tests), `:1930` inverted (`restyle_and_resize_redraw_the_appearance`), `:2161`
-/// tie-break swapped (`stamps_draw_their_label_and_by_line`, the same tie-break as here) and
-/// `:1241` `/Parent` renamed (`every_tool_creates_a_drawable_comment`). This file shares that
+/// `create.rs:47` inverted (`ink_strokes_are_smooth_curves_through_their_points`), `create.rs:216` inverted
+/// (six inline tests), `modify.rs:547` inverted (`restyle_and_resize_redraw_the_appearance`),
+/// `info.rs:151` tie-break swapped (`stamps_draw_their_label_and_by_line`, the same tie-break as
+/// here) and `create.rs:450` `/Parent` renamed (`every_tool_creates_a_drawable_comment`). This file shares that
 /// credit and claims none of it alone. The other FIVE are killed only by tests added here, and
 /// they share a different family — the clamp is REMOVED outright, or introduced where the code
-/// does not have one: `lib.rs:1030` deleted, `lib.rs:857` deleted, the opacity clamp at `:1024`
-/// removed, the colour clamp in `rgb()` at `:824` removed (killed only by
+/// does not have one: `create.rs:216` deleted, `create.rs:47` deleted, the opacity clamp at
+/// `create.rs:212` removed, the colour clamp in `rgb()` at `create.rs:14` removed (killed only by
 /// `malformed::the_same_huge_fill_is_accepted_on_create_and_refused_on_edit`), and a clamp ADDED
-/// to the read path at `:2238`. Note that `lib.rs:857` appears on both sides, and deliberately so:
+/// to the read path at `info.rs:231`. Note that `create.rs:47` appears on both sides, and
+/// deliberately so:
 /// inverting that clamp trips an inline test as well, while deleting it trips nothing but
 /// `a_negative_and_a_zero_border_pad_a_line_identically`. Confusing those two mutations is easy
 /// enough to produce a false refutation, so the distinction is recorded here rather than left to
@@ -978,7 +980,7 @@ fn a_full_rewrite_into_object_streams_describes_the_same_comments_as_a_plain_tab
     assert_eq!(summaries(&plain).len(), summaries(&packed).len());
 
     // The plain-table output is bigger here: object streams compress, which is the point of them.
-    let opts = SaveOptions { mod_date: None, id_seed: 0x5052_494E_5443_5241, object_streams: true };
+    let opts = SaveOptions { mod_date: None, id_seed: 0x5052_494E_5443_5241, object_streams: true, drop_unlinked: false };
     let packed_bytes = pdfcraft_cos::write_full(&doc, &opts).expect("writes");
     assert!(
         packed_bytes.len() < pdfcraft_cos::write_full(&doc, &SaveOptions { object_streams: false, ..opts }).expect("writes").len(),
@@ -991,24 +993,24 @@ fn a_full_rewrite_into_object_streams_describes_the_same_comments_as_a_plain_tab
 /// Negative border width — CURRENT behaviour, measured on this branch, not an endorsement.
 ///
 /// `add_annotation` screens width for NON-FINITENESS only. The guard at
-/// `crates/annot/src/lib.rs:1018` reads
+/// `crates/annot/src/create.rs:416` reads
 /// `!finite(&style.color) || !style.opacity.is_finite() || !style.width.is_finite()`: the
-/// `abs() < 1e7` cap belongs to `finite()` (`:827-829`) and is applied to `color` alone, so width
+/// `abs() < 1e7` cap belongs to `finite()` (`create.rs:17-19`) and is applied to `color` alone, so width
 /// carries no magnitude limit at all. Measured on this branch: `width = 1e9` and `width = 1e299`
 /// are both ACCEPTED and written to `/BS /W` verbatim (a 10-digit number, then a 300-digit one),
 /// while `color = [1e9, 0, 0]` is refused with `Invalid("invalid style")`.
 /// So `width = -4.0` is ACCEPTED too; the value reaching `/BS /W` comes from `style.width.max(0.0)`
-/// (`:1030`) and the `/Rect` growth from `style.width.max(0.0) / 2.0` (`:857`). The file then holds
+/// (`create.rs:216`) and the `/Rect` growth from `style.width.max(0.0) / 2.0` (`create.rs:47`). The file then holds
 /// `0`, and neither document's repair log records it. (`finite()` magnitude-screens `color`;
 /// `opacity` and `width` get finiteness checks only, and the interior `fill` is not screened by it.)
 ///
 /// The edit path behaves identically for width: `set_style` applies the same kind of screen
-/// (`:1896`) and `width = Some(-2.5)` is accepted, storing `0`. There is therefore NO
+/// (`modify.rs:513`) and `width = Some(-2.5)` is accepted, storing `0`. There is therefore NO
 /// create-vs-edit asymmetry for negative widths — unlike a huge or non-finite fill colour, which
-/// creation never screens (`:1018` magnitude-screens `color`, finiteness-checks `opacity` and
+/// creation never screens (`create.rs:416` magnitude-screens `color`, finiteness-checks `opacity` and
 /// `width`, and takes no look at `fill`, which is merely clamped component-wise by `rgb()` at
-/// `:823-825`) while the edit path refuses the same
-/// value explicitly near `:2010`. Flagged for maintainers rather than asserted as
+/// `create.rs:13-15`) while the edit path refuses the same
+/// value explicitly near `modify.rs:626`. Flagged for maintainers rather than asserted as
 /// correct: a refusal, or at minimum a repair-log entry naming the substitution, would be the
 /// stricter design. If either clamp changes or goes away, this test fails on purpose so that
 /// decision is made in the open.
@@ -1032,17 +1034,18 @@ fn negative_border_width_is_accepted_and_stored_as_zero() {
     let mut doc = blank(1);
     add_annotation(&mut doc, &styled(0, Shape::Oval { rect: [5.0, 5.0, 65.0, 35.0] }, "w", [1.0, 0.0, 0.0], 1.0, 2.0, None), &meta("neg2"))
         .expect("adds");
-    set_style(&mut doc, 0, 0, None, None, Some(-2.5), None, &meta("neg2")).expect("the edit path screens non-finite and magnitude, not sign");
+    set_style(&mut doc, 0, 0, StyleChange::new(None, None, Some(-2.5), None), &meta("neg2"))
+        .expect("the edit path screens non-finite and magnitude, not sign");
     let (file, reopened) = save_and_reopen(&doc, Save::FullTable);
     assert_eq!(props(&reopened, 0, 0).and_then(|p| p.width), Some(0.0), "an edited negative width is stored as zero too");
     assert!(!file.windows(4).any(|x| x == b"-2.5"), "the negative literal never reaches the file");
     assert!(doc.repair_log().is_empty() && reopened.repair_log().is_empty(), "silently, with nothing recorded");
 }
 
-/// The `/Rect` half of the same guard (`lib.rs:857`). Measured on this branch: `Rectangle` and
+/// The `/Rect` half of the same guard (`create.rs:62-82` and `:47`). Measured on this branch: `Rectangle` and
 /// `Oval` store the given `/Rect` verbatim, so they cannot detect this guard at all — a first
 /// version of this test compared rectangles and survived the mutation, which is exactly how an
-/// empty test looks green. `Shape::Line` IS padded by it (`:897`, `pad = half + arrow`), so the
+/// empty test looks green. `Shape::Line` IS padded by it (`create.rs:87`, `pad = half + arrow`), so the
 /// comparison is made there: with `-9pt` and `0pt` borders a line's `/Rect` must grow identically,
 /// because `max(0.0)` collapses both before the padding is applied.
 #[test]
@@ -1071,7 +1074,7 @@ fn a_negative_and_a_zero_border_pad_a_line_identically() {
     let rect_zero = bytes::numbers_of(&zero, "Rect");
     assert!(!rect_minus.is_empty(), "the -9pt file must contain a /Rect array of numbers");
     assert!(!rect_zero.is_empty(), "the 0pt file must contain a /Rect array of numbers");
-    assert_eq!(rect_minus, rect_zero, "-9pt and 0pt borders must pad a line's /Rect identically — max(0.0) at :857 is what guarantees it");
+    assert_eq!(rect_minus, rect_zero, "-9pt and 0pt borders must pad a line's /Rect identically — max(0.0) at create.rs:47 is what guarantees it");
     // `/BS /W` is a SCALAR real, never an array, so `numbers_of` (which only accepts `[...]`)
     // compared two empty lists here and passed whatever the file contained. `scalars_of` is the
     // right helper, and both sides are guarded non-empty so this can never go green on missing data.
@@ -1079,5 +1082,5 @@ fn a_negative_and_a_zero_border_pad_a_line_identically() {
     let w_zero = bytes::scalars_of(&zero, "W");
     assert!(!w_minus.is_empty() && !w_zero.is_empty(), "both files must actually write a /BS /W, got {w_minus:?} vs {w_zero:?}");
     assert_eq!(w_minus, w_zero, "and both store the same /BS /W");
-    assert_eq!(w_minus.as_slice(), &[0.0], "the clamp at lib.rs:857 stores a negative border width as 0");
+    assert_eq!(w_minus.as_slice(), &[0.0], "the clamp at create.rs:47 stores a negative border width as 0");
 }
