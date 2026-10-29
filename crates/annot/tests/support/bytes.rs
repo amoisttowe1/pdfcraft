@@ -255,7 +255,6 @@ pub fn text_of_raw(bytes: &[u8]) -> String {
     match bytes {
         [0xFE, 0xFF, rest @ ..] => String::from_utf16_lossy(&rest.as_chunks::<2>().0.iter().map(|p| u16::from_be_bytes(*p)).collect::<Vec<_>>()),
         [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
-        b if !b.is_ascii() && std::str::from_utf8(b).is_ok() => String::from_utf8_lossy(b).into_owned(),
         b => b.iter().map(|&c| char::from(c)).collect(),
     }
 }

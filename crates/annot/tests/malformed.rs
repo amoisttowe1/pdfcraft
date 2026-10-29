@@ -18,7 +18,7 @@ mod support {
 
 use pdfcraft_annot::{
     AnnotError, AttachIcon, Meta, NewAnnotation, NoteIcon, Shape, Style, add_annotation, delete_annotation, has_visible_fill_sign, links, page_refs,
-    picture_rotation, props, signature_image, summaries,
+    picture_rotation, props, set_annots, signature_image, summaries,
 };
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 use proptest::prelude::*;
@@ -680,8 +680,9 @@ fn tag(path: Save) -> String {
     format!("{path:?}")
 }
 
-/// The kinds of damage a stranger's annotation dictionary can carry. Each is applied to a comment
-/// PdfCraft wrote, so the file stays structurally valid around one wrong entry.
+/// The kinds of damage a stranger's annotation data can carry. Twelve wreck the dictionary of a
+/// comment PdfCraft wrote, so the file stays structurally valid around one wrong entry; the
+/// duplicate-entry kind instead repeats that comment's entry in the page's `/Annots`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Damage {
     RectTooShort,
@@ -715,10 +716,24 @@ const DAMAGES: [Damage; 13] = [
     Damage::VerticesOddLength,
 ];
 
-/// Apply one damage to the annotation dictionary at `/Annots[index]`, resolving it first if inline.
+/// Apply one damage. Twelve of the kinds wreck the annotation dictionary at `/Annots[index]`
+/// itself; the duplicate-entry kind instead lists that entry twice in the page's `/Annots`.
 fn damage(doc: &mut Document, index: usize, kind: Damage) {
     let entries = annot_entries(doc, 0);
     let Some(r) = entries.get(index).and_then(|e| e.as_ref()) else { return };
+    if kind == Damage::DuplicateEntryInAnnots {
+        // The damage lives on the page, not the dictionary: the same entry object appears twice in
+        // `/Annots`, so the page lists one annotation dictionary through two slots. Routed through
+        // `set_annots`, the same writer the crate itself uses, so both storage shapes (array
+        // inline in the page, array behind a reference) are rewritten the way mainline rewrites.
+        let mut list = annot_entries(doc, 0);
+        if let Some(slot) = list.get(index).cloned() {
+            list.insert(index, slot);
+            let page = ObjRef::new(*page_object_numbers(doc).first().expect("the page exists"), 0);
+            set_annots(doc, page, list).expect("the page dictionary is editable");
+        }
+        return;
+    }
     doc.update_dict(r, |d| match kind {
         Damage::RectTooShort => d.set(b"Rect".to_vec(), Object::Array(vec![Object::Real(10.0), Object::Real(20.0)])),
         Damage::RectWrongType => {
@@ -734,9 +749,7 @@ fn damage(doc: &mut Document, index: usize, kind: Damage) {
         Damage::PopupDangling => d.set(b"Popup".to_vec(), Object::Ref(ObjRef::new(9997, 0))),
         Damage::ParentToMissingObject => d.set(b"Parent".to_vec(), Object::Ref(ObjRef::new(9998, 0))),
         Damage::IrtSelfReference => d.set(b"IRT".to_vec(), Object::Ref(r)),
-        Damage::DuplicateEntryInAnnots => {
-            d.set(b"Rect".to_vec(), Object::Array(vec![Object::Real(1.0), Object::Real(2.0), Object::Real(3.0)]));
-        }
+        Damage::DuplicateEntryInAnnots => unreachable!("this damage edits the page, not the dictionary"),
         Damage::InkListWrongShape => d.set(b"InkList".to_vec(), Object::Array(vec![Object::Real(5.0), Object::name("notastroke")])),
         Damage::VerticesOddLength => d.set(b"Vertices".to_vec(), Object::Array(vec![Object::Real(1.0), Object::Real(2.0), Object::Real(3.0)])),
     })
@@ -767,8 +780,9 @@ proptest! {
             // The undamaged comments are untouched by the damage and its save.
             let after = summaries(&reopened);
             // A comment stops being listed only when the damage removes what makes it a comment —
-            // its `/Subtype` (measured, not assumed: the other twelve damages all stay listed).
-            let want_listed = clean_rect.len() - usize::from(kind == Damage::SubtypeMissing);
+            // its `/Subtype` (measured, not assumed). The other damages all leave it listed; the
+            // duplicate-entry damage lists one comment through two slots, so it adds a listing.
+            let want_listed = clean_rect.len() - usize::from(kind == Damage::SubtypeMissing) + usize::from(kind == Damage::DuplicateEntryInAnnots);
             prop_assert_eq!(after.len(), want_listed, "damage {k} on {p}: listed comment count", k = format!("{kind:?}"), p = tag(path));
             // Every undamaged comment keeps its exact rectangle through the damage and the rewrite.
             for r in &clean_rect[1..] {
